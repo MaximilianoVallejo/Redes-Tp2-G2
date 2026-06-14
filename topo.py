@@ -32,14 +32,40 @@ class NATTopo(Topo):
     def build(self):
         s1 = self.addSwitch('s1')
 
-        h1 = self.addHost('h1', ip='200.0.0.1/24',
-                          mac='00:00:00:00:00:01', defaultRoute='via 200.0.0.254')
+        h1 = self.addHost(
+            'h1',
+            ip='200.0.0.1/24',
+            mac='00:00:00:00:00:01',
+            defaultRoute='via 200.0.0.254'
+        )
 
-        h2 = self.addHost('h2', ip='192.168.1.2/24', mac='00:00:00:00:00:02',
-                          defaultRoute='via 192.168.1.254')
+        h2 = self.addHost(
+            'h2',
+            ip='192.168.1.2/24',
+            mac='00:00:00:00:00:02',
+            defaultRoute='via 192.168.1.254'
+        )
+
+        # TP2 - Punto 6.1
+        # Nuevos hosts privados para pruebas de NAT/PAT
+        h3 = self.addHost(
+            'h3',
+            ip='192.168.1.3/24',
+            mac='00:00:00:00:00:03',
+            defaultRoute='via 192.168.1.254'
+        )
+
+        h4 = self.addHost(
+            'h4',
+            ip='192.168.1.4/24',
+            mac='00:00:00:00:00:04',
+            defaultRoute='via 192.168.1.254'
+        )
 
         self.addLink(h1, s1)
         self.addLink(h2, s1)
+        self.addLink(h3, s1)
+        self.addLink(h4, s1)
 
 
 def run():
@@ -59,9 +85,16 @@ def run():
     s1.cmd("sysctl -w net.ipv6.conf.default.disable_ipv6=1")
     s1.cmd("sysctl -w net.ipv6.conf.lo.disable_ipv6=1")
 
-    # Entradas ARP para debug (TODO: Usar Protocolo ARP)
-    net.get('h1').setARP('200.0.0.254', '00:00:00:aa:aa:aa')
-    net.get('h2').setARP('192.168.1.254', '00:00:00:bb:bb:bb')
+    # TP2 - Punto 6.1
+    # Se eliminaron las entradas ARP estáticas.
+    #
+    # El punto 6.2 implementará:
+    #   - ARP Requests
+    #   - ARP Replies
+    #   - Tabla ARP dinámica
+    #
+    # No deben existir configuraciones ARP estáticas
+    # en hosts ni en el controlador.
 
     CLI(net)
     net.stop()
