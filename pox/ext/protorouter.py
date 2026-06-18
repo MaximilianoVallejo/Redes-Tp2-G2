@@ -5,6 +5,9 @@ from pox.lib.addresses import EthAddr, IPAddr           # Address types
 from pox.lib.packet.ethernet import ethernet, ETHER_BROADCAST
 from pox.lib.packet.arp import arp
 from pox.lib.recoco import Timer
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.tcp import tcp
+from pox.lib.packet.udp import udp
 
 log = core.getLogger()
 RED = "\033[31m"
@@ -32,6 +35,13 @@ IP_ANY = IPAddr("0.0.0.0")                  # Usado para descartar ARP probes (s
 ARP_RETRY_INTERVAL = 2   # Segundos entre reintentos de ARP Request
 ARP_MAX_RETRIES = 5      # Cantidad máxima de reintentos antes de descartar
 
+# Punto 6.3: NAT por puertos (PAT) ------------------------------
+TCP_TIMEOUT = 300      # 5 minutos para TCP establecido
+TCP_FIN_TIMEOUT = 30   # 30 segundos después de FIN
+UDP_TIMEOUT = 30       # 30 segundos para UDP
+NAT_PORT_START = 10000
+NAT_PORT_END = 11000
+
 
 class ProtoRouter(object):
     def __init__(self, connection):
@@ -51,6 +61,13 @@ class ProtoRouter(object):
 
         # Reintento periódico de ARP Requests sin respuesta.
         Timer(ARP_RETRY_INTERVAL, self._retry_pending_arps, recurring=True)
+
+        # Punto 6.3: NAT por puertos (PAT)
+        self.nat_table = {} # Mapea (IPPrivada, PuertoPrivado) -> PuertoPublico
+        self.available_ports = set(range(NAT_PORT_START, NAT_PORT_END + 1)) # Puertos públicos disponibles para asignar a hosts privados
+        self.used_ports = {} # Puertos actualmente asignados
+
+
 
     # ----------------------------------------------------------------
     # Dispatcher principal
@@ -241,70 +258,266 @@ class ProtoRouter(object):
         # el paquete. Esto alimenta la tabla ARP dinámica.
         self.learn(ip_pkt.srcip, packet.src, in_port)
 
-        if not ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-            log_color(RED, f"NO MATCH: {ip_pkt.srcip} no pertenece a {PRIVATE_SUBNET}/{PRIVATE_MASK}")
+        if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+            # Saliente (Privdo -> Público)
+            log_color(GREEN, f"MATCH: {ip_pkt.srcip} pertenece a la red privada {PRIVATE_SUBNET}/{PRIVATE_MASK}")
+            self.handle_outgoing(event)
+        else:
+            # Entrante (Público -> Privadp)
+            log_color(CYAN, f"MATCH: {ip_pkt.srcip} pertenece a la red pública")
+            self.handle_incoming(event)
+
+
+    # ----------------------------------------------------------------
+    # Manejo de NAT por puertos (PAT)
+    # ----------------------------------------------------------------
+    def assign_public_port(self): 
+        if not self.available_ports:
+            log_color(RED, "No hay puertos públicos disponibles para asignar a hosts privados.")
+            return None
+        port = self.available_ports.pop()
+        return port
+        
+    def release_public_port(self, pub_port):
+        if pub_port in self.used_ports:
+            del self.used_ports[pub_port]
+            self.available_ports.add(pub_port)
+
+    def extract_transport(self, ip_pkt):
+        if ip_pkt.protocol == 6:  # TCP
+            tcp = ip_pkt.payload
+            return (6, tcp.srcport, tcp.dstport)
+        elif ip_pkt.protocol == 17:  # UDP
+            udp = ip_pkt.payload
+            return (17, udp.srcport, udp.dstport)
+        else:
+            return (None, None, None)
+
+    def get_or_create_nat_entry(self, key):
+        if key in self.nat_table:
+            return self.nat_table[key]
+        else:
+            pub_port = self.assign_public_port()
+            if pub_port is None:
+                return None
+            self.nat_table[key] = pub_port
+            self.used_ports[pub_port] = key
+            log_color(GREEN, f"Nueva entrada NAT creada: {key} -> puerto público {pub_port}")
+            return pub_port
+
+    def handle_outgoing(self, event): 
+        packet = event.parsed
+        ip_pkt = packet.payload
+        in_port = event.port
+        
+        proto, src_port, dst_port = self.extract_transport(ip_pkt)
+        if proto is None:
+            # No es TCP/UDP, ignorar
+            log_color(YELLOW, f"Paquete no TCP/UDP, ignorado por NAT: protocolo {ip_pkt.protocol}")
             return
-
-        log_color(GREEN, f"MATCH: {ip_pkt.srcip} pertenece a la red privada {PRIVATE_SUBNET}/{PRIVATE_MASK}")
-
+        log_color(CYAN, f"Paquete outgoing: {ip_pkt.srcip}:{src_port} -> {ip_pkt.dstip}:{dst_port} (proto {proto})")
+        
         # TP2 - Punto 6.2: en vez de una MAC de destino hardcodeada
         # (H1_MAC), se resuelve dinámicamente mediante ARP. Si todavía
         # no se conoce, el paquete se encola y se dispara un ARP Request;
         # cuando llegue la respuesta (handle_arp -> resolve_pending) este
         # mismo método se vuelve a invocar para terminar de procesarlo.
+
+        # Resolver MAC destino
         resolved = self.resolve_mac(ip_pkt.dstip)
         if resolved is None:
-            log_color(YELLOW, f"MAC de {ip_pkt.dstip} desconocida, resolviendo por ARP antes de continuar...")
+            log_color(YELLOW, f"MAC de {ip_pkt.dstip} desconocida, resolviendo por ARP...")
             self.queue_pending(ip_pkt.dstip, event)
             return
+        dst_mac, dst_port_switch = resolved
+        
 
-        dst_mac, dst_port = resolved
+        # TP2 - Punto 6.3: NAT por puertos (PAT) - tráfico saliente.
+        # Procesa paquetes que van de la red privada a la red pública.
+        # - Detecta TCP/UDP y extrae puertos
+        # - Crea/actualiza entrada en tabla NAT
+        # - Traduce IP origen y puerto origen
+        # - Prepara datos para instalación de flujos (event.nat_info)
+        # - Reenvía el paquete traducido
 
-        # Instalar Flujo Saliente
-        fm = of.ofp_flow_mod()
-        fm.idle_timeout = 10
+        # Buscar/Crear entrada NAT
+        key = (ip_pkt.srcip, src_port, ip_pkt.dstip, dst_port, proto)
+        pub_port = self.get_or_create_nat_entry(key)
+        if pub_port is None:
+            log_color(RED, f"No se pudo asignar puerto público para {key}, paquete droppeado")
+            return
+        
+        # Info para usar en instalación de flujos
+        event.nat_info = {
+            "type": "outgoing",
+            "key": key,
+            "pub_port": pub_port,
+            "src_ip": ip_pkt.srcip,
+            "src_port": src_port,
+            "dst_ip": ip_pkt.dstip,
+            "dst_port": dst_port,
+            "dst_mac": dst_mac,
+            "dst_port_switch": dst_port_switch,
+            "proto": proto,
+            "in_port": in_port,
+            "original_mac_src": packet.src,
+        }
 
-        # Filtro (Saliente)
-        fm.match.nw_src = ip_pkt.srcip
-        fm.match.nw_dst = ip_pkt.dstip
-        fm.match.dl_type = 0x800  # IPv4
-        fm.match.in_port = in_port
+        original_src_ip = ip_pkt.srcip
+        original_src_port = src_port
 
-        # Acción (Saliente)
-        fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
-        fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
-        fm.actions.append(of.ofp_action_output(port=dst_port))
-        self.connection.send(fm)
-
-        # Instalar Flujo Entrante (para la respuesta)
-        fm_back = of.ofp_flow_mod()
-        fm_back.idle_timeout = 10
-
-        # Filtro (Entrante)
-        fm_back.match.nw_src = ip_pkt.dstip
-        fm_back.match.nw_dst = ip_pkt.srcip
-        fm_back.match.dl_type = 0x800  # IPv4
-        fm_back.match.in_port = dst_port
-
-        # Acción (Entrante)
-        fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
-        fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
-        fm_back.actions.append(of.ofp_action_output(port=in_port))
-        self.connection.send(fm_back)
+        # Traducción del paquete actual (solo para este paquete, 
+        # los siguientes pasan directo por las reglas de flujo)
+        ip_pkt.srcip = PUBLIC_IP
+        if proto == 6:  # TCP
+            ip_pkt.payload.srcport = pub_port
+        elif proto == 17:  # UDP
+            ip_pkt.payload.srcport = pub_port
+        
+        packet.src = PUBLIC_MAC
+        packet.dst = dst_mac
 
         # Reenviar el paquete actual con las MACs ya traducidas
         # (los paquetes siguientes de este flujo pasan directo por las
         # reglas instaladas, sin intervención del controlador).
-        packet.src = PUBLIC_MAC
-        packet.dst = dst_mac
         msg = of.ofp_packet_out()
         msg.data = packet.pack()
-        msg.actions.append(of.ofp_action_output(port=dst_port))
+        msg.actions.append(of.ofp_action_output(port=dst_port_switch))
         log_color(
             CYAN,
             f"ENVIANDO: {ip_pkt.srcip} → {ip_pkt.dstip} | "
             f"MAC: {PUBLIC_MAC} → {dst_mac} | Out Port: {dst_port}")
         self.connection.send(msg)
+        log_color(GREEN, f"Paquete traducido y enviado: {PUBLIC_IP}:{pub_port} -> {ip_pkt.dstip}:{dst_port} (proto {proto})")
+
+        # ==========================================================
+        #  REFERENCIA PARA INSTALACIÓN DE FLUJOS
+        # ==========================================================
+        # Este codigo es como se instalaban los flujos originalmente (solo MAC, sin NAT).
+        # Hay que adaptarlo para usar NAT de IP y puertos usando event.nat_info
+        #
+        # # Instalar Flujo Saliente
+        # fm = of.ofp_flow_mod()
+        # fm.idle_timeout = 10
+
+        # # Filtro (Saliente)
+        # fm.match.nw_src = ip_pkt.srcip
+        # fm.match.nw_dst = ip_pkt.dstip
+        # fm.match.dl_type = 0x800  # IPv4
+        # fm.match.in_port = in_port
+
+        # # Acción (Saliente)
+        # fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
+        # fm.actions.append(of.ofp_action_dl_addr.set_dst(dst_mac))
+        # fm.actions.append(of.ofp_action_output(port=dst_port))
+        # self.connection.send(fm)
+
+        # # Instalar Flujo Entrante (para la respuesta)
+        # fm_back = of.ofp_flow_mod()
+        # fm_back.idle_timeout = 10
+
+        # # Filtro (Entrante)
+        # fm_back.match.nw_src = ip_pkt.dstip
+        # fm_back.match.nw_dst = ip_pkt.srcip
+        # fm_back.match.dl_type = 0x800  # IPv4
+        # fm_back.match.in_port = dst_port
+
+        # # Acción (Entrante)
+        # fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
+        # fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
+        # fm_back.actions.append(of.ofp_action_output(port=in_port))
+        # self.connection.send(fm_back)
+
+
+    def handle_incoming(self, event):
+        packet = event.parsed
+        ip_pkt = packet.payload
+        in_port = event.port
+        
+        proto, src_port, dst_port = self.extract_transport(ip_pkt)
+        if proto is None:
+            log_color(YELLOW, f"Paquete no TCP/UDP, ignorado para NAT entrante")
+            return
+        
+        log_color(CYAN, f"INCOMING: {ip_pkt.srcip}:{src_port} → {ip_pkt.dstip}:{dst_port} (proto={proto})")
+
+        # TP2 - Punto 6.3: NAT por puertos (PAT) - tráfico entrante.
+        # Procesa paquetes que van de la red pública a la red privada.
+        # - Busca en tabla NAT por puerto público destino
+        # - Destraduce IP destino y puerto destino
+        # - Prepara datos para instalación de flujos (event.nat_info)
+        # - Reenvía el paquete destraducido
+        
+        # Buscar en tabla NAT
+        if dst_port not in self.used_ports:
+            log_color(YELLOW, f"Puerto {dst_port} no está en uso por NAT, ignorando")
+            return
+        
+        key = self.used_ports[dst_port]
+        priv_ip, priv_port, pub_dest_ip, pub_dest_port, proto_match = key
+        
+        if proto != proto_match:
+            log_color(YELLOW, f"Protocolo no coincide: {proto} vs {proto_match}")
+            return
+        
+        log_color(CYAN, f"NAT ENCONTRADO: puerto {dst_port} → {priv_ip}:{priv_port}")
+        
+        # Resolver MAC privada
+        resolved = self.resolve_mac(priv_ip)
+        if resolved is None:
+            log_color(YELLOW, f"MAC de {priv_ip} desconocida, resolviendo por ARP...")
+            self.queue_pending(priv_ip, event)
+            return
+        priv_mac, priv_port_switch = resolved
+        
+        # ===== DATOS PARA FLUJOS =====
+        event.nat_info = {
+            "type": "incoming",
+            "key": key,
+            "priv_ip": priv_ip,
+            "priv_port": priv_port,
+            "priv_mac": priv_mac,
+            "priv_port_switch": priv_port_switch,
+            "pub_port": dst_port,
+            "src_ip": ip_pkt.srcip,
+            "src_port": src_port,
+            "proto": proto,
+            "in_port": in_port,
+            "original_mac_src": packet.src,
+        }
+        
+        # Destraduccion del paquete actual
+        ip_pkt.dstip = priv_ip
+        if proto == 6:  # TCP
+            ip_pkt.payload.dstport = priv_port
+        elif proto == 17:  # UDP
+            ip_pkt.payload.dstport = priv_port
+        
+        packet.src = PRIVATE_MAC
+        packet.dst = priv_mac
+        
+        msg = of.ofp_packet_out()
+        msg.data = packet.pack()
+        msg.actions.append(of.ofp_action_output(port=priv_port_switch))
+        self.connection.send(msg)
+        
+        log_color(GREEN, f"PAQUETE DESTRADUCIDO: {ip_pkt.srcip}:{src_port} → {priv_ip}:{priv_port}")
+        
+        # ================================================================
+        # REFERENCIA PARA INSTALACIÓN DE FLUJOS ENTRANTES
+        # ================================================================
+        # Similar al outgoing, pero invirtiendo la lógica.
+        # Usar event.nat_info para obtener los datos.
+        # ================================================================
+
+    def _get_nat_timeout(self, proto):
+        if proto == 6:  # TCP
+            return TCP_TIMEOUT
+        elif proto == 17:  # UDP
+            return UDP_TIMEOUT
+        else:
+            return None
+        
 
 
 def launch():
