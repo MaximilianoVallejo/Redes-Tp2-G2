@@ -304,11 +304,11 @@ class ProtoRouter(object):
         self.learn(ip_pkt.srcip, packet.src, in_port)
 
         if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-            # Saliente (Privdo -> Público)
+            # Saliente (Privado -> Público)
             log_color(GREEN, f"MATCH: {ip_pkt.srcip} pertenece a la red privada {PRIVATE_SUBNET}/{PRIVATE_MASK}")
             self.handle_outgoing(event)
         else:
-            # Entrante (Público -> Privadp)
+            # Entrante (Público -> Privado)
             log_color(CYAN, f"MATCH: {ip_pkt.srcip} pertenece a la red pública")
             self.handle_incoming(event)
 
