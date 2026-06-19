@@ -8,6 +8,7 @@ from pox.lib.recoco import Timer
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.tcp import tcp
 from pox.lib.packet.udp import udp
+from dataclasses import dataclass
 
 log = core.getLogger()
 RED = "\033[31m"
@@ -41,6 +42,36 @@ TCP_FIN_TIMEOUT = 30   # 30 segundos después de FIN
 UDP_TIMEOUT = 30       # 30 segundos para UDP
 NAT_PORT_START = 10000
 NAT_PORT_END = 11000
+
+
+@dataclass
+class NatInfo:
+    """Datos de una traducción NAT. Base común."""
+    key: tuple              # (src_ip, src_port, dst_ip, dst_port, proto)
+    pub_port: int
+    src_ip: IPAddr
+    src_port: int
+    proto: int
+    in_port: int
+    original_mac_src: EthAddr
+
+
+@dataclass
+class OutgoingNatInfo(NatInfo):
+    """Tráfico privada -> pública. El próximo salto es el host público."""
+    dst_ip: IPAddr
+    dst_port: int
+    dst_mac: EthAddr
+    dst_port_switch: int
+
+
+@dataclass
+class IncomingNatInfo(NatInfo):
+    """Tráfico pública -> privada. El próximo salto es el host privado."""
+    priv_ip: IPAddr
+    priv_port: int
+    priv_mac: EthAddr
+    priv_port_switch: int
 
 
 class ProtoRouter(object):
@@ -348,20 +379,19 @@ class ProtoRouter(object):
             return
         
         # Info para usar en instalación de flujos
-        event.nat_info = {
-            "type": "outgoing",
-            "key": key,
-            "pub_port": pub_port,
-            "src_ip": ip_pkt.srcip,
-            "src_port": src_port,
-            "dst_ip": ip_pkt.dstip,
-            "dst_port": dst_port,
-            "dst_mac": dst_mac,
-            "dst_port_switch": dst_port_switch,
-            "proto": proto,
-            "in_port": in_port,
-            "original_mac_src": packet.src,
-        }
+        event.nat_info = OutgoingNatInfo(
+            key=key,
+            pub_port=pub_port,
+            src_ip=ip_pkt.srcip,
+            src_port=src_port,
+            proto=proto,
+            in_port=in_port,
+            original_mac_src=packet.src,
+            dst_ip=ip_pkt.dstip,
+            dst_port=dst_port,
+            dst_mac=dst_mac,
+            dst_port_switch=dst_port_switch,
+        )
 
         original_src_ip = ip_pkt.srcip
         original_src_port = src_port
@@ -394,7 +424,10 @@ class ProtoRouter(object):
         #  REFERENCIA PARA INSTALACIÓN DE FLUJOS
         # ==========================================================
         # Este codigo es como se instalaban los flujos originalmente (solo MAC, sin NAT).
-        # Hay que adaptarlo para usar NAT de IP y puertos usando event.nat_info
+        # Hay que adaptarlo para usar NAT de IP y puertos usando event.nat_info,
+        # que es una instancia de OutgoingNatInfo: acceder a sus campos como
+        # atributos (event.nat_info.pub_port) y discriminar el tipo de tráfico
+        # con isinstance(event.nat_info, OutgoingNatInfo).
         #
         # # Instalar Flujo Saliente
         # fm = of.ofp_flow_mod()
@@ -471,20 +504,19 @@ class ProtoRouter(object):
         priv_mac, priv_port_switch = resolved
         
         # ===== DATOS PARA FLUJOS =====
-        event.nat_info = {
-            "type": "incoming",
-            "key": key,
-            "priv_ip": priv_ip,
-            "priv_port": priv_port,
-            "priv_mac": priv_mac,
-            "priv_port_switch": priv_port_switch,
-            "pub_port": dst_port,
-            "src_ip": ip_pkt.srcip,
-            "src_port": src_port,
-            "proto": proto,
-            "in_port": in_port,
-            "original_mac_src": packet.src,
-        }
+        event.nat_info = IncomingNatInfo(
+            key=key,
+            pub_port=dst_port,
+            src_ip=ip_pkt.srcip,
+            src_port=src_port,
+            proto=proto,
+            in_port=in_port,
+            original_mac_src=packet.src,
+            priv_ip=priv_ip,
+            priv_port=priv_port,
+            priv_mac=priv_mac,
+            priv_port_switch=priv_port_switch,
+        )
         
         # Destraduccion del paquete actual
         ip_pkt.dstip = priv_ip
@@ -507,7 +539,9 @@ class ProtoRouter(object):
         # REFERENCIA PARA INSTALACIÓN DE FLUJOS ENTRANTES
         # ================================================================
         # Similar al outgoing, pero invirtiendo la lógica.
-        # Usar event.nat_info para obtener los datos.
+        # Usar event.nat_info (instancia de IncomingNatInfo) para obtener los
+        # datos: acceder a sus campos como atributos (event.nat_info.priv_ip) y
+        # discriminar con isinstance(event.nat_info, IncomingNatInfo).
         # ================================================================
 
     def _get_nat_timeout(self, proto):
