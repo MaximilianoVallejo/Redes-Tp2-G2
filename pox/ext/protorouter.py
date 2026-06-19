@@ -44,10 +44,24 @@ NAT_PORT_START = 10000
 NAT_PORT_END = 11000
 
 
+@dataclass(frozen=True)
+class NatKey:
+    """Clave de una conexión NAT: identifica un flujo de forma única.
+
+    Es frozen=True para ser hasheable y poder usarse como clave de
+    nat_table y como valor en used_ports.
+    """
+    src_ip: IPAddr
+    src_port: int
+    dst_ip: IPAddr
+    dst_port: int
+    proto: int
+
+
 @dataclass
 class NatInfo:
     """Datos de una traducción NAT. Base común."""
-    key: tuple              # (src_ip, src_port, dst_ip, dst_port, proto)
+    key: NatKey
     pub_port: int
     src_ip: IPAddr
     src_port: int
@@ -94,7 +108,7 @@ class ProtoRouter(object):
         Timer(ARP_RETRY_INTERVAL, self._retry_pending_arps, recurring=True)
 
         # Punto 6.3: NAT por puertos (PAT)
-        self.nat_table = {} # Mapea (IPPrivada, PuertoPrivado) -> PuertoPublico
+        self.nat_table = {} # Mapea NatKey -> PuertoPublico
         self.available_ports = set(range(NAT_PORT_START, NAT_PORT_END + 1)) # Puertos públicos disponibles para asignar a hosts privados
         self.used_ports = {} # Puertos actualmente asignados
 
@@ -372,7 +386,7 @@ class ProtoRouter(object):
         # - Reenvía el paquete traducido
 
         # Buscar/Crear entrada NAT
-        key = (ip_pkt.srcip, src_port, ip_pkt.dstip, dst_port, proto)
+        key = NatKey(ip_pkt.srcip, src_port, ip_pkt.dstip, dst_port, proto)
         pub_port = self.get_or_create_nat_entry(key)
         if pub_port is None:
             log_color(RED, f"No se pudo asignar puerto público para {key}, paquete droppeado")
@@ -487,7 +501,11 @@ class ProtoRouter(object):
             return
         
         key = self.used_ports[dst_port]
-        priv_ip, priv_port, pub_dest_ip, pub_dest_port, proto_match = key
+        # El flujo se registró en el sentido saliente, así que el origen de
+        # la clave es el host privado y el destino es el host público.
+        priv_ip = key.src_ip
+        priv_port = key.src_port
+        proto_match = key.proto
         
         if proto != proto_match:
             log_color(YELLOW, f"Protocolo no coincide: {proto} vs {proto_match}")
