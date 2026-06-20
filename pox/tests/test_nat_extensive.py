@@ -1,24 +1,4 @@
-"""
-Tests extensivos para protorouter.py (TP2 - SDN NAT).
 
-Cubren:
-  - Manejo de ARP (resolución dinámica, cola de pendientes, reintentos)
-  - NAT por puertos / PAT (asignación, reuso, múltiples clientes, TCP/UDP)
-  - Instalación de flujos OpenFlow (saliente / entrante, matches y acciones)
-  - Liberación de recursos al expirar un flujo (FlowRemoved)
-  - Camino completo: paquete real (Ethernet+IP+TCP/UDP) entrando al
-    controlador, sin mockear la lógica de negocio, solo connection.send().
-
-No requieren Mininet ni un controlador POX corriendo: se instancia
-ProtoRouter directamente con una conexión mockeada, igual que en
-test_unit_router.py.
-
-Ejecutar:
-    cd pox
-    python3 -m pytest tests/test_nat_extensive.py -v
-    # o sin pytest:
-    python3 tests/test_nat_extensive.py
-"""
 import os
 import sys
 import unittest
