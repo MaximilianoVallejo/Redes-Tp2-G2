@@ -35,7 +35,6 @@ ARP_MAX_RETRIES = 5      # Cantidad máxima de reintentos antes de descartar
 
 # Punto 6.3: NAT por puertos (PAT) ------------------------------
 TCP_TIMEOUT = 300      # 5 minutos para TCP establecido
-TCP_FIN_TIMEOUT = 30   # 30 segundos después de FIN
 UDP_TIMEOUT = 30       # 30 segundos para UDP
 NAT_PORT_START = 10000
 NAT_PORT_END = 11000
@@ -162,6 +161,7 @@ class ProtoRouter(object):
         else:
             # Si alguien estaba esperando esta MAC, se reprocesan los
             # paquetes IP que habían quedado pendientes.
+            self.forward_arp_reply(arp_pkt)
             self.resolve_pending(arp_pkt.protosrc)
 
     def handle_arp_request(self, arp_pkt, in_port):
@@ -171,10 +171,8 @@ class ProtoRouter(object):
         elif in_port != PUBLIC_PORT and arp_pkt.protodst == PRIVATE_IP:
             our_mac = PRIVATE_MAC
         else:
-            log_color(
-                RED,
-                f"ARP REQUEST ignorado: {arp_pkt.protodst} no es una IP propia "
-                f"para la interfaz del puerto {in_port}")
+            log_color(CYAN, f"ARP REQUEST flood: {arp_pkt.protodst} no es IP del router")
+            self.flood_arp_request(arp_pkt)
             return
 
         log_color(GREEN, f"ARP REPLY: {arp_pkt.protodst} está en {our_mac} -> puerto {in_port}")
@@ -204,6 +202,36 @@ class ProtoRouter(object):
         msg = of.ofp_packet_out()
         msg.data = eth.pack()
         msg.actions.append(of.ofp_action_output(port=out_port))
+        self.connection.send(msg)
+
+    def flood_arp_request(self, arp_req):
+        eth = ethernet()
+        eth.type = ethernet.ARP_TYPE
+        eth.src = arp_req.hwsrc
+        eth.dst = ETHER_BROADCAST
+        eth.payload = arp_req
+
+        msg = of.ofp_packet_out()
+        msg.data = eth.pack()
+        msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+        self.connection.send(msg)
+
+    def forward_arp_reply(self, arp_pkt):
+        requester = self.resolve_mac(arp_pkt.protodst)
+        if requester is None:
+            log_color(YELLOW, f"ARP REPLY sin destino conocido: {arp_pkt.protosrc} -> {arp_pkt.protodst}")
+            return
+
+        requester_mac, requester_port = requester
+        eth = ethernet()
+        eth.type = ethernet.ARP_TYPE
+        eth.src = arp_pkt.hwsrc
+        eth.dst = requester_mac
+        eth.payload = arp_pkt
+
+        msg = of.ofp_packet_out()
+        msg.data = eth.pack()
+        msg.actions.append(of.ofp_action_output(port=requester_port))
         self.connection.send(msg)
 
     def send_arp_request(self, target_ip):
@@ -302,6 +330,13 @@ class ProtoRouter(object):
         # TP2 - Punto 6.2: aprendemos (IP, MAC, puerto) del host que envía
         # el paquete. Esto alimenta la tabla ARP dinámica.
         self.learn(ip_pkt.srcip, packet.src, in_port)
+
+        # Tráfico interno dentro de la red privada no pasa por NAT.
+        # Se resuelve por ARP y se reenvía directo en capa 2.
+        if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK) and ip_pkt.dstip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+            log_color(CYAN, f"MATCH: {ip_pkt.srcip} -> {ip_pkt.dstip} dentro de la red privada, sin NAT")
+            self.handle_private_local(event)
+            return
 
         if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
             # Saliente (Privado -> Público)
@@ -443,7 +478,28 @@ class ProtoRouter(object):
         self.install_outgoing_flow(
             proto=info.proto, priv_ip=info.src_ip, priv_port=info.src_port,
             server_ip=info.dst_ip, server_port=info.dst_port, pub_port=info.pub_port,
-            in_port=info.in_port, server_mac=info.dst_mac, out_port=info.dst_port_switch)
+            in_port=info.in_port, server_mac=info.dst_mac, out_port=info.dst_port_switch,
+            idle_timeout=self._get_nat_timeout(proto))
+
+    def handle_private_local(self, event):
+        packet = event.parsed
+        ip_pkt = packet.payload
+
+        resolved = self.resolve_mac(ip_pkt.dstip)
+        if resolved is None:
+            log_color(YELLOW, f"MAC de {ip_pkt.dstip} desconocida, resolviendo por ARP...")
+            self.queue_pending(ip_pkt.dstip, event)
+            return
+
+        dst_mac, dst_port_switch = resolved
+        packet.dst = dst_mac
+
+        msg = of.ofp_packet_out()
+        msg.data = packet.pack()
+        msg.actions.append(of.ofp_action_output(port=dst_port_switch))
+        self.connection.send(msg)
+
+        log_color(GREEN, f"PAQUETE LOCAL reenviado: {ip_pkt.srcip} -> {ip_pkt.dstip} (puerto {dst_port_switch})")
 
 
     def handle_incoming(self, event):
@@ -529,7 +585,8 @@ class ProtoRouter(object):
         self.install_incoming_flow(
             proto=info.proto, server_ip=info.src_ip, server_port=info.src_port,
             pub_port=info.pub_port, in_port=info.in_port, priv_ip=info.priv_ip,
-            priv_port=info.priv_port, priv_mac=info.priv_mac, out_port=info.priv_port_switch)
+            priv_port=info.priv_port, priv_mac=info.priv_mac, out_port=info.priv_port_switch,
+            idle_timeout=self._get_nat_timeout(proto))
 
     @staticmethod
     def _get_nat_timeout(proto):
@@ -544,14 +601,15 @@ class ProtoRouter(object):
     # Punto 6.4: instalación de flujos OpenFlow
     # ----------------------------------------------------------------
     def install_outgoing_flow(self, proto, priv_ip, priv_port, server_ip,
-                              server_port, pub_port, in_port, server_mac, out_port):
+                              server_port, pub_port, in_port, server_mac, out_port,
+                              idle_timeout=None):
         """Flujo saliente (privada -> pública): traduce origen IP+puerto+MAC.
 
         Lleva SEND_FLOW_REM: este flujo es el dueño del ciclo de vida de la
         conexión y dispara la liberación de recursos al expirar.
         """
         fm = of.ofp_flow_mod()
-        fm.idle_timeout = self._get_nat_timeout(proto)
+        fm.idle_timeout = idle_timeout if idle_timeout is not None else self._get_nat_timeout(proto)
         fm.flags |= of.OFPFF_SEND_FLOW_REM
         m = fm.match
         m.in_port = in_port                 # puerto del switch del host privado
@@ -571,14 +629,15 @@ class ProtoRouter(object):
                          f"{server_ip}:{server_port} (pub_port {pub_port})")
 
     def install_incoming_flow(self, proto, server_ip, server_port, pub_port,
-                              in_port, priv_ip, priv_port, priv_mac, out_port):
+                              in_port, priv_ip, priv_port, priv_mac, out_port,
+                              idle_timeout=None):
         """Flujo entrante (pública -> privada): destraduce destino IP+puerto+MAC.
 
         No lleva SEND_FLOW_REM: el flujo saliente es el dueño del ciclo de vida;
         este se borra explícitamente en el teardown o expira por idle en silencio.
         """
         fm = of.ofp_flow_mod()
-        fm.idle_timeout = self._get_nat_timeout(proto)
+        fm.idle_timeout = idle_timeout if idle_timeout is not None else self._get_nat_timeout(proto)
         m = fm.match
         m.in_port = in_port                 # PUBLIC_PORT
         m.dl_type = 0x800                   # IPv4
